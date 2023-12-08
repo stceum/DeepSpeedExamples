@@ -95,10 +95,15 @@ def parse_args():
                         type=int,
                         default=1,
                         help="Total number of training epochs to perform.")
+    # Reference: https://github.com/eric-mitchell/direct-preference-optimization/blob/main/trainers.py
     parser.add_argument("--beta",
                         type=float,
                         default=1e-1,
-                        help="Beta for the KL divergence.")
+                        help="Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.")
+    parser.add_argument("--label_smoothing",
+                        type=float,
+                        default=0.0,
+                        help="conservativeness for DPO loss, which assumes that preferences are noisy (flipped with probability label_smoothing)")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -207,10 +212,10 @@ def parse_args():
 
 # Reference: https://github.com/huggingface/trl/blob/main/trl/trainer/dpo_trainer.py
 def get_batch_logps(logits, input_ids, label_mask):
-    labels = input_ids * label_mask
+    labels = input_ids.clone() * label_mask
     assert logits.shape[:-1] == labels.shape, \
         "Logits (batch and sequence length dim) and labels must have the same shape."
-    labels = labels[:, 1:].clone()
+    labels = labels[:, 1:]
     label_mask = label_mask[:, 1:]
     logits = logits[:, :-1, :]
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
@@ -355,7 +360,8 @@ def main():
             ref_rejected_logps = ref_logps[batch_size:]
 
             logits = args.beta * ((chosen_logps - ref_chosen_logps) - (rejected_logps - ref_rejected_logps))
-            loss = - torch.nn.functional.logsigmoid(logits).mean(0)
+            loss = (- torch.nn.functional.logsigmoid(logits) * (1 - args.label_smoothing) - \
+                        torch.nn.functional.logsigmoid(-logits) * args.label_smoothing).mean(0)
             losses += loss.float()
         losses = losses / (step + 1)
         try:
@@ -440,7 +446,8 @@ def main():
             ref_rejected_logps = ref_logps[batch_size:]
 
             logits = args.beta * ((chosen_logps - ref_chosen_logps) - (rejected_logps - ref_rejected_logps))
-            loss = - torch.nn.functional.logsigmoid(logits).mean(0)
+            loss = (- torch.nn.functional.logsigmoid(logits) * (1 - args.label_smoothing) - \
+                        torch.nn.functional.logsigmoid(-logits) * args.label_smoothing).mean(0)
             if args.print_loss:
                 print(
                     f"Epoch: {epoch}, Step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}"
