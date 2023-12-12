@@ -16,10 +16,11 @@ class PromptRawDataset(object):
         self.output_path = output_path
         self.seed = seed
         self.local_rank = local_rank
-        if os.path.exists(dataset_name):
-            self.raw_datasets = load_from_disk(dataset_name)
-        elif not dataset_name == 'local/jsonfile':
-            self.raw_datasets = load_dataset(dataset_name)
+        if not 'alpaca_farm' in dataset_name:
+            if os.path.exists(dataset_name):
+                self.raw_datasets = load_from_disk(dataset_name)
+            elif not dataset_name == 'local/jsonfile':
+                self.raw_datasets = load_dataset(dataset_name)
 
     def get_train_data(self):
         return
@@ -770,3 +771,97 @@ class LmqgQagjaquadDataset(PromptRawDataset):
             f"Warning: dataset {self.dataset_name} does not include rejected response."
         )
         return None
+
+
+# AlpacaFarm dataset
+class AlpacaFarmDataset(PromptRawDataset):
+
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "tatsu-lab/alpaca_farm_instructions"
+        self.dataset_name_clean = "tatsu_lab_alpaca_farm_instructions"
+        self.raw_datasets = load_dataset('json',
+                                         data_files={
+                                             "train":
+                                             dataset_name + '/sft.json',
+                                             "eval":
+                                             dataset_name + '/val.json'
+                                         })
+
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+
+    def get_eval_data(self):
+        # print(
+        #     f"Warning: dataset {self.dataset_name} does not include eval dataset."
+        # )
+        # return None
+        return self.raw_datasets["eval"]
+
+    def get_prompt(self, sample):
+        if not sample['instruction'].endswith(sample['input']):
+            return " Human: " + sample['instruction'] + sample['input'] + " Assistant:"
+        else:
+            return " Human: " + sample['instruction'] + " Assistant:"
+
+    def get_chosen(self, sample):
+        return " " + sample['output']
+
+    def get_rejected(self, sample):
+        print(
+            f"Warning: dataset {self.dataset_name} does not include rejected response."
+        )
+        return None
+
+    def get_prompt_and_chosen(self, sample):
+        return self.get_prompt(sample) + " " + sample['output']
+
+    def get_prompt_and_rejected(self, sample):
+        print(
+            f"Warning: dataset {self.dataset_name} does not include rejected response."
+        )
+        return None
+
+
+# AlpacaFarm dataset
+class AlpacaFarmComparisonsDataset(PromptRawDataset):
+
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "tatsu-lab/alpaca_farm"
+        self.dataset_name_clean = "tatsu_lab_alpaca_farm"
+        self.raw_datasets = load_dataset('json',
+                                         data_files={
+                                             "train":
+                                             dataset_name + '/train.json',
+                                             "eval":
+                                             dataset_name + '/test.json'
+                                         })
+
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+
+    def get_eval_data(self):
+        return self.raw_datasets["eval"]
+
+    def get_prompt(self, sample):
+        if not sample['instruction'].endswith(sample['input']):
+            return " Human: " + sample['instruction'] + sample['input'] + " Assistant:"
+        else:
+            return " Human: " + sample['instruction'] + " Assistant:"
+
+    def get_chosen(self, sample):
+        assert sample['preference'] in [1,2]
+        chosen = sample['output_1'] if sample['preference'] == 1 else sample['output_2']
+        return " " + chosen
+
+    def get_rejected(self, sample):
+        assert sample['preference'] in [1,2]
+        rejected = sample['output_1'] if sample['preference'] == 2 else sample['output_2']
+        return " " + rejected
+
+    def get_prompt_and_chosen(self, sample):
+        return self.get_prompt(sample) + self.get_chosen(sample)
+
+    def get_prompt_and_rejected(self, sample):
+        return self.get_prompt(sample) + self.get_rejected(sample)
