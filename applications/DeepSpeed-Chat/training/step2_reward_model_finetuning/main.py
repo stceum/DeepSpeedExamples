@@ -13,16 +13,17 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     SchedulerType,
     get_scheduler,
+    AutoModelForCausalLM
 )
 
 import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from deepspeed.accelerator import get_accelerator
 
-from dschat.utils.model.model_utils import create_critic_model
+from dschat.utils.model.model_utils import create_critic_model, create_hf_model
 from dschat.utils.data.data_utils import create_prompt_dataset, DataCollatorReward
 from dschat.utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, get_optimizer_grouped_parameters, save_zero_three_model, load_hf_tokenizer
-from dschat.utils.ds_utils import get_train_ds_config
+from dschat.utils.ds_utils import get_train_ds_config, get_eval_ds_config
 from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_to_linear_layer, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
 
 
@@ -202,6 +203,23 @@ def parse_args():
         "--add_eot_token",
         action='store_true',
         help="Add <|endoftext|> as additional special token to tokenizer")
+
+    ## Method for controlling scale of the reward
+    parser.add_argument(
+        "--method_for_controlling_scale_of_reward",
+        type=str,
+        default='none',
+        choices=['none', 'length_ratio', 'cosine_similarity'],
+        help='Select the method for controlling the scale of the reward.')
+    parser.add_argument(
+        "--threshold_for_controlling_scale_of_reward",
+        type=float,
+        default=0.6,
+        help=
+        "Scale the loss of reward model when similarity of chosen and rejected "
+        "is larger than the threshold."
+    )
+
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
 
@@ -251,6 +269,34 @@ def main():
                                    dropout=args.dropout,
                                    zero_stage=args.zero_stage,
                                    compute_fp32_loss=args.compute_fp32_loss)
+
+    # DS Config for ref model
+    ref_zero_stage = args.zero_stage
+    if ref_zero_stage != 3:
+        # If it is ZeRO-3 then we use it for everything, otherwise assume we have enough memory for ref model
+        ref_zero_stage = 0
+    ref_ds_config = get_eval_ds_config(offload=False,
+                                       dtype=args.dtype,
+                                       stage=ref_zero_stage)
+    ref_ds_config[
+        'train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
+    ref_ds_config[
+        'train_batch_size'] = args.per_device_train_batch_size * torch.distributed.get_world_size(
+        ) * args.gradient_accumulation_steps
+    ref_ds_eval_config = get_eval_ds_config(offload=False,
+                                            dtype=args.dtype,
+                                            stage=ref_zero_stage)
+    ref_ds_eval_config[
+        'train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
+    ref_ds_eval_config[
+        'train_batch_size'] = args.per_device_train_batch_size * torch.distributed.get_world_size(
+        ) * args.gradient_accumulation_steps
+    ref_model = create_hf_model(AutoModelForCausalLM,
+                                args.model_name_or_path,
+                                tokenizer,
+                                ref_ds_eval_config,
+                                dropout=args.dropout)
+    # End of DS config for ref model
 
     # Model bigscience/bloom-560m has large variance at ln_f.weight parameter
     # This makes bf16 finetuning hard.
@@ -352,6 +398,8 @@ def main():
         config=ds_config,
         lr_scheduler=lr_scheduler,
         dist_init_required=True)
+    ref_model, *_ = deepspeed.initialize(model=ref_model, config=ref_ds_config)
+    ref_model.eval()
 
     if args.gradient_checkpointing:
         rm_model.gradient_checkpointing_enable()
@@ -378,6 +426,13 @@ def main():
         mean_loss = 0
         for step, batch in enumerate(train_dataloader):
             batch = to_device(batch, device)
+            ref_logits = None
+            if args.method_for_controlling_scale_of_reward == 'cosine_similarity':
+                with torch.no_grad():
+                    ref_logits = ref_model(**batch)
+            batch['scale_control_method'] = args.method_for_controlling_scale_of_reward
+            batch['ref_logits'] = ref_logits[0]
+            batch['scale_control_threshold'] = args.threshold_for_controlling_scale_of_reward
             outputs = rm_model(**batch, use_cache=False)
             loss = outputs["loss"]
             rm_model.backward(loss)

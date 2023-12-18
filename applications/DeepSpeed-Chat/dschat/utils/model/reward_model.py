@@ -46,7 +46,10 @@ class RewardModel(nn.Module):
                 position_ids=None,
                 head_mask=None,
                 inputs_embeds=None,
-                use_cache=False):
+                use_cache=False,
+                scale_control_method='none',
+                scale_control_threshold=0.6,
+                ref_logits=None):
         loss = None
 
         if self.config.model_type == "llama":
@@ -112,8 +115,33 @@ class RewardModel(nn.Module):
             if self.compute_fp32_loss:
                 c_truncated_reward = c_truncated_reward.float()
                 r_truncated_reward = r_truncated_reward.float()
-            loss += -torch.nn.functional.logsigmoid(c_truncated_reward -
-                                                    r_truncated_reward).mean()
+
+            scaling_factor = 1
+            if scale_control_method == 'length_ratio':
+                c_truncated_pad_size = len((chosen_id[divergence_ind:end_ind] == self.PAD_ID).nonzero())
+                r_truncated_pad_size = len((rejected_id[divergence_ind:end_ind] == self.PAD_ID).nonzero())
+                longer_len = end_ind - divergence_ind.squeeze()
+                if longer_len != 0:
+                    similarity = (longer_len - max(c_truncated_pad_size, r_truncated_pad_size)) / longer_len
+                else:
+                    similarity = 1
+            elif scale_control_method == 'cosine_similarity':
+                assert ref_logits != None, \
+                    "Reference logits is needed for reward controlling method 'cosine_similarity'"
+                c_ref_end_logits = ref_logits[i][c_ind - 1]
+                r_ref_end_logits = ref_logits[i+bs][r_ind - 1]
+                if not hasattr(self, 'cos'):
+                    self.cos = nn.CosineSimilarity(dim=0)
+                similarity = self.cos(c_ref_end_logits, r_ref_end_logits).squeeze()
+
+            if scale_control_method != 'none':
+                if similarity < scale_control_threshold:
+                    scaling_factor = 1
+                else:
+                    scaling_factor = 1 - similarity
+
+            loss += - scaling_factor * torch.nn.functional.logsigmoid(c_truncated_reward -
+                                                                      r_truncated_reward).mean()
 
         loss = loss / bs
         chosen_mean_scores = torch.stack(chosen_mean_scores)
